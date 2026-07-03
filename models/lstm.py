@@ -7,135 +7,145 @@ import torchvision
 import torchvision.transforms as transforms
 import torch.optim as optim
 from .embedding_model import Embedding_Model
+from torch.utils.data import TensorDataset, DataLoader
 
 device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
 
 
-class embedded_LSTM():
-    def __init__(self, config):
-        """
-        Initialize the model. It takes in the parameters for the model from the config.
-        This class holds both the Embedder and the core LSTM PyTorch logic.
-        """
-        self.config = config
-        self.device = device
+class embedded_LSTM(nn.Module):
+    def __init__(self, cat_emb_dims, num_continuous, hidden_size):
+        super(embedded_LSTM, self).__init__()
         
-        # 1. Initialize the Embedding Model (Class 1)
-        self.embedder = Embedding_Model(config).to(self.device)
+        # 1. The Embedding Layers
+        self.embeddings = nn.ModuleList([
+            nn.Embedding(num_classes, emb_dim) for num_classes, emb_dim in cat_emb_dims
+        ])
         
-        # 2. Calculate the total input size for the LSTM
-        total_emb_size = sum(emb_dim for _, emb_dim in config['cat_emb_dims'])
-        num_continuous = config['num_continuous']
+        total_emb_size = sum(emb_dim for _, emb_dim in cat_emb_dims)
         total_lstm_input_size = total_emb_size + num_continuous
-        hidden_size = config.get('hidden_size', 64)
         
-        # 3. Initialize the core LSTM and output heads (PyTorch primitives)
+        # 2. The LSTM Layer
         self.lstm = nn.LSTM(
             input_size=total_lstm_input_size, 
             hidden_size=hidden_size, 
             num_layers=1, 
             batch_first=True
-        ).to(self.device)
+        )
         
-        # Multi-task heads: One for WPA (Regression) and one for Play Type (Classification)
-        self.wpa_head = nn.Linear(hidden_size, 1).to(self.device)
-        self.action_head = nn.Linear(hidden_size, 3).to(self.device)
-        
-        # 4. Set up optimizers and loss functions
-        self.criterion_classification = nn.CrossEntropyLoss()
-        self.criterion_regression = nn.MSELoss()
-        
-        # We optimize both the embeddings and the LSTM simultaneously 
-        # (unless embeddings were frozen in the Embedding_Model init)
-        params = list(self.embedder.parameters()) + list(self.lstm.parameters()) + \
-                 list(self.wpa_head.parameters()) + list(self.action_head.parameters())
-                 
-        self.optimizer = optim.Adam(params, lr=config.get('learning_rate', 0.001))
+        # 3. The Multi-Task Output Heads
+        self.wpa_head = nn.Linear(hidden_size, 1)
+        self.action_head = nn.Linear(hidden_size, 3)
 
-    def predict(self, X):
+    def forward(self, cont_x, cat_x):
         """
-        Function that will be called to make predictions using the model. 
-        It takes in the confounders/state X and returns the predicted outcome/label.
+        The standard forward pass used during training.
+        Outputs raw action_logits (for CrossEntropyLoss) and wpa_pred (for MSELoss).
         """
-        self.embedder.eval()
-        self.lstm.eval()
+        emb_outputs = []
+        for i, emb_layer in enumerate(self.embeddings):
+            embedded_feature = emb_layer(cat_x[:, :, i])
+            emb_outputs.append(embedded_feature)
+            
+        embedded_cat_x = torch.cat(emb_outputs, dim=-1)
+        fused_input = torch.cat([cont_x, embedded_cat_x], dim=-1)
+        
+        lstm_out, _ = self.lstm(fused_input)
+        final_step_out = lstm_out[:, -1, :]
+        
+        wpa_pred = self.wpa_head(final_step_out).squeeze()
+        action_logits = self.action_head(final_step_out)
+        
+        return action_logits, wpa_pred
+
+    def predict(self, cont_x, cat_x):
+        """Inference method that safely disables gradients, fixes dimensions, and outputs final classes."""
+        
+        # 1. Enforce strict data types and push to the GPU
+        cont_x = cont_x.to(dtype=torch.float32, device=device)
+        cat_x = cat_x.to(dtype=torch.long, device=device)
+        
+        # 2. Automatically add the sequence dimension if it is missing
+        # Transforms [batch, features] into [batch, 1, features]
+        if cont_x.dim() == 2:
+            cont_x = cont_x.unsqueeze(1)
+        if cat_x.dim() == 2:
+            cat_x = cat_x.unsqueeze(1)
+            
+        # Store training state
+        was_training = self.training
+        self.eval()
         
         with torch.no_grad():
-            cont_x = X['cont'].to(self.device)
-            cat_x = X['cat'].to(self.device)
+            # Get the raw outputs from the forward pass
+            action_logits, wpa_pred = self.forward(cont_x, cat_x)
             
-            # 1. Get embeddings from our Embedding_Model
-            embedded_features = self.embedder.predict(cat_x)
-            
-            # 2. Combine continuous variables with the new embeddings
-            fused_input = torch.cat([cont_x, embedded_features], dim=-1)
-            
-            # 3. Pass through LSTM
-            lstm_out, _ = self.lstm(fused_input)
-            final_step_out = lstm_out[:, -1, :] # Grab the context of the final play
-            
-            # 4. Generate predictions
-            predicted_wpa = self.wpa_head(final_step_out).squeeze()
-            action_logits = self.action_head(final_step_out)
+            # Convert the 3 raw action logits into a single final class prediction
             predicted_actions = torch.argmax(action_logits, dim=1)
             
-        return predicted_actions, predicted_wpa
+        # Restore training state
+        if was_training:
+            self.train()
+            
+        return predicted_actions, wpa_pred
+    
+    def fit(self, X_cont, X_cat, A, Y, epochs=10, batch_size=64, lr=0.001):
+        """
+        The integrated training loop.
+        Accepts raw PyTorch tensors, formats them, and trains the model.
+        """
+        # 1. Enforce strict data types to prevent PyTorch crashes
+        X_cont = X_cont.to(dtype=torch.float32)
+        X_cat = X_cat.to(dtype=torch.long)
+        A = A.to(dtype=torch.long)
+        Y = Y.to(dtype=torch.float32)
 
-    def train(self, X, A, Y):
-        """
-        Function that will be called to train the model. 
-        It takes in the confounders/state X, the action/treatment A, and the outcome/label Y.
-        """
-        self.embedder.train()
-        self.lstm.train()
-        
-        epochs = self.config.get('epochs', 10)
-        batch_size = self.config.get('batch_size', 64)
-        dataset_size = len(A)
-        
-        print(f"\nStarting training loop on {self.device}...")
-        
+        # 2. Automatically add the sequence dimension if it is missing
+        # Transforms [batch, features] into [batch, 1, features]
+        if X_cont.dim() == 2:
+            X_cont = X_cont.unsqueeze(1)
+        if X_cat.dim() == 2:
+            X_cat = X_cat.unsqueeze(1)
+
+        # 3. Create the DataLoader
+        dataset = TensorDataset(X_cont, X_cat, A, Y)
+        train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+        # 4. Initialize Optimizer and Loss Functions
+        optimizer = optim.Adam(self.parameters(), lr=lr)
+        criterion_cls = nn.CrossEntropyLoss()
+        criterion_reg = nn.MSELoss()
+
+        # Ensure the model is in training mode
+        self.train()
+        print(f"Starting training on {device} for {epochs} epochs...")
+
+        # 5. The Training Loop
         for epoch in range(epochs):
             running_loss = 0.0
             
-            # Manually shuffle and batch the dataset
-            indices = torch.randperm(dataset_size)
-            
-            for i in range(0, dataset_size, batch_size):
-                batch_idx = indices[i : i + batch_size]
+            for batch_cont, batch_cat, batch_A, batch_Y in train_loader:
+                # Push batches to the AMD graphics card
+                batch_cont = batch_cont.to(device)
+                batch_cat = batch_cat.to(device)
+                batch_A = batch_A.to(device)
+                batch_Y = batch_Y.to(device)
                 
-                # Move batches to GPU
-                cont_batch = X['cont'][batch_idx].to(self.device)
-                cat_batch = X['cat'][batch_idx].to(self.device)
-                action_batch = A[batch_idx].to(self.device)
-                wpa_batch = Y[batch_idx].to(self.device)
-                
-                self.optimizer.zero_grad()
+                optimizer.zero_grad()
                 
                 # Forward Pass
-                embedded_features = self.embedder.predict(cat_batch)
-                fused_input = torch.cat([cont_batch, embedded_features], dim=-1)
+                action_logits, wpa_pred = self.forward(batch_cont, batch_cat)
                 
-                lstm_out, _ = self.lstm(fused_input)
-                final_step_out = lstm_out[:, -1, :]
-                
-                wpa_pred = self.wpa_head(final_step_out).squeeze()
-                action_logits = self.action_head(final_step_out)
-                
-                # Compute combined loss (Classification + Regression)
-                loss_cls = self.criterion_classification(action_logits, action_batch)
-                loss_reg = self.criterion_regression(wpa_pred, wpa_batch)
+                # Calculate Combined Loss
+                loss_cls = criterion_cls(action_logits, batch_A)
+                loss_reg = criterion_reg(wpa_pred, batch_Y)
                 total_loss = loss_cls + loss_reg
                 
-                # Backpropagation
+                # Backpropagate
                 total_loss.backward()
-                self.optimizer.step()
+                optimizer.step()
                 
                 running_loss += total_loss.item()
                 
-            avg_loss = running_loss / (dataset_size / batch_size)
+            avg_loss = running_loss / len(train_loader)
             print(f"Epoch [{epoch+1}/{epochs}] - Loss: {avg_loss:.4f}")
-            
-
-        print("Training complete. Models and metrics ready for saving.")
