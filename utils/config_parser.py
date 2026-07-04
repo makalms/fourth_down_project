@@ -10,4 +10,4 @@ def parse_config(config_name):
     config.read('config.ini')
     if config_name not in config:
         raise ValueError(f"Config {config_name} not found in config.ini")
-    return dict(config[config_name])
+    return {key: eval(value) for key, value in config[config_name].items()}

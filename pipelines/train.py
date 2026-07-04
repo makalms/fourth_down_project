@@ -13,6 +13,7 @@ sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from utils import parse_config
 from dataloading import fetch_data
 from models import Embedding_Model
+from models import BaseLSTM
 
 
 def handle_argv():
@@ -35,13 +36,12 @@ if __name__ == '__main__':
     model_type = config.get('model_type')
     if model_type == 'embedding_model':
         model = Embedding_Model(config)
+    elif model_type == 'lstm_model':
+        model = BaseLSTM(config)
     # elif model_type == 'other_model_type':
         # model = other_model_type(config)
     else:
         raise ValueError(f"Model type {model_type} not recognized. Please specify a valid model type in the config.")
-
-    # Fetch the data using the dataloader according to the specifications in the config
-    X, A, Y = fetch_data(config)
-
+    
     # Train the model using the fetched data
-    model.train(X, A, Y)
+    model.training_loop()
