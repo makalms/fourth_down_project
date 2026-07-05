@@ -89,7 +89,7 @@ class embedded_LSTM(nn.Module):
             
         return predicted_actions, wpa_pred
     
-    def fit(self, X_cont, X_cat, A, Y, epochs=10, batch_size=64, lr=0.001):
+    def fit(self, X_cont, X_cat, A, Y, X_cont_val=None, X_cat_val=None, A_val=None, Y_val=None, epochs=10, batch_size=64, lr=0.001):
         """
         The integrated training loop.
         Accepts raw PyTorch tensors, formats them, and trains the model.
@@ -110,6 +110,22 @@ class embedded_LSTM(nn.Module):
         # 3. Create the DataLoader
         dataset = TensorDataset(X_cont, X_cat, A, Y)
         train_loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+        # Setup Validation DataLoader (if provided)
+        do_validation = X_cont_val is not None
+        if do_validation:
+            X_cont_val = X_cont_val.to(dtype=torch.float32)
+            X_cat_val = X_cat_val.to(dtype=torch.long)
+            A_val = A_val.to(dtype=torch.long)
+            Y_val = Y_val.to(dtype=torch.float32)
+            
+            if X_cont_val.dim() == 2: X_cont_val = X_cont_val.unsqueeze(1)
+            if X_cat_val.dim() == 2: X_cat_val = X_cat_val.unsqueeze(1)
+                
+            val_dataset = TensorDataset(X_cont_val, X_cat_val, A_val, Y_val)
+            val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False) # No need to shuffle validation
+
+
 
         # 4. Initialize Optimizer and Loss Functions
         optimizer = optim.Adam(self.parameters(), lr=lr)
@@ -147,5 +163,25 @@ class embedded_LSTM(nn.Module):
                 
                 running_loss += total_loss.item()
                 
-            avg_loss = running_loss / len(train_loader)
-            print(f"Epoch [{epoch+1}/{epochs}] - Loss: {avg_loss:.4f}")
+            avg_train_loss = running_loss / len(train_loader)
+
+            if do_validation:
+                self.eval() # Disable dropout/batchnorm for validation
+                running_val_loss = 0.0
+                
+                with torch.no_grad(): # Stop tracking gradients (saves memory & speeds up)
+                    for v_cont, v_cat, v_A, v_Y in val_loader:
+                        v_cont, v_cat, v_A, v_Y = v_cont.to(device), v_cat.to(device), v_A.to(device), v_Y.to(device)
+                        
+                        val_logits, val_wpa = self.forward(v_cont, v_cat)
+                        
+                        val_loss_cls = criterion_cls(val_logits, v_A)
+                        val_loss_reg = criterion_reg(val_wpa, v_Y)
+                        running_val_loss += (val_loss_cls + val_loss_reg).item()
+                        
+                avg_val_loss = running_val_loss / len(val_loader)
+                print(f"Epoch [{epoch+1}/{epochs}] - Train Loss: {avg_train_loss:.4f} | Val Loss: {avg_val_loss:.4f}")
+            else:
+                print(f"Epoch [{epoch+1}/{epochs}] - Train Loss: {avg_train_loss:.4f}")
+
+
