@@ -29,18 +29,22 @@ class BaseLSTM(Model, nn.Module):
         self.hidden_size = config.get("hidden_size", 128)
         self.num_layers = config.get("num_layers", 3)
         self.input_size = config.get("input_size", 5)
+        self.a_mappings = config.get("a_mappings", {'go (run/pass)': 0, 'punt': 1, 'fg': 2})
         self.bidirectional = config.get("bidirectional", True)
         self.output_size = config.get("output_size", 1)
         self.device = config.get("device", 'cuda')  # Use 'cuda' for GPU or 'cpu' for CPU
         # Switch to using cpu if cuda is not available
-        if self.device == 'cuda' and not torch.cuda.is_available():
-            print("CUDA is not available, switching to CPU.")
+        if self.device == 'cuda' and torch.cuda.is_available() == False:
+            print("CUDA is not available. Switching to CPU.")
             self.device = 'cpu'
         self.batch_size = config.get("batch_size", 64)
         self.dropout = config.get("dropout", 0.1)
         self.learning_rate = config.get("learning_rate", 0.001)
         self.epochs = config.get("epochs", 500)
         self.patience = config.get("patience", 10)
+
+        # set seed for reproducibility
+        torch.manual_seed(42)
 
         # hidden_size * 2 because it's bidirectional
         lstm_output_size = self.hidden_size * 2 if self.bidirectional else self.hidden_size
@@ -61,13 +65,13 @@ class BaseLSTM(Model, nn.Module):
         self.state_input_layer = nn.Linear(self.input_size, 8)
 
         # Action input layer for one-hot encodings
-        self.action_input_layer = nn.Linear(6, 6) # Assuming 6 unique actions, output size is 6)
+        self.action_input_layer = nn.Linear(len(self.a_mappings), len(self.a_mappings))
 
         # Combination layer to combine the state and action embeddings
-        self.combination_layer = nn.Linear(8 + 6, self.hidden_size)
+        self.combination_layer = nn.Linear(8 + len(self.a_mappings), self.hidden_size)
 
         # Fully connected layer
-        self.fc = nn.Linear(lstm_output_size, self.output_size)
+        self.fc = nn.Linear(self.hidden_size, self.output_size)
 
         # Initialize the LSTM weights using Xavier initialization
         def init_weights(m):
@@ -99,7 +103,7 @@ class BaseLSTM(Model, nn.Module):
         combined_input = torch.cat((state_embedding, action_embedding), dim=2)
 
         # Pass through the combination layer
-        combined_input = self.combination_layer(combined_input)
+        combined_input = self.combination_layer(combined_input).to(self.device)
 
         # Initialize hidden and cell states
         num_directions = 2 if self.bidirectional else 1
@@ -141,7 +145,7 @@ class BaseLSTM(Model, nn.Module):
 
         # Split the data into training and testing sets according to the specifications in the config. Also split the data into X, A, Y according to the specifications in the config.
         X_cols = self.config.get("x_columns", ['qtr', 'game_seconds_remaining', 'yardline_100', 'ydstogo', 'score_differential'])
-        A_cols = self.config.get("a_columns", ['play_type'])
+        A_cols = self.config.get("a_columns", ['label'])
         Y_cols = self.config.get("y_columns", ['epa'])
         train_seasons = self.config.get("training_seasons", [2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019])
         test_seasons = self.config.get("testing_seasons", [2020, 2021])
@@ -177,24 +181,29 @@ class BaseLSTM(Model, nn.Module):
         test_Y_scaled = y_scaler.transform(test_Y.values.reshape(-1, 1)).flatten()
 
         # One-hot encode the action
-        train_A_encoded = pd.get_dummies(train_A, columns=A_cols, dtype=int)
-        test_A_encoded = pd.get_dummies(test_A, columns=A_cols, dtype=int)
+        train_A_encoded = pd.DataFrame(columns=self.a_mappings.keys())
+        for action in self.a_mappings.keys():
+            train_A_encoded[action] = (train_A.values.flatten() == action).astype(int)
+        test_A_encoded = pd.DataFrame(columns=self.a_mappings.keys())
+        for action in self.a_mappings.keys():
+            test_A_encoded[action] = (test_A.values.flatten() == action).astype(int)
 
         # Reshape the data to include sequence length (1)
         train_X_scaled = train_X_scaled.reshape(train_X_scaled.shape[0], 1, train_X_scaled.shape[1])
         test_X_scaled = test_X_scaled.reshape(test_X_scaled.shape[0], 1, test_X_scaled.shape[1])
-        train_A_encoded = train_A_encoded.values.reshape(train_A_encoded.shape[0], 1, train_A_encoded.shape[1])
+        train_A_encoded = torch.stack([torch.FloatTensor([a]) for a in train_A_encoded])
+        test_A_encoded = torch.stack([torch.FloatTensor([a]) for a in test_A_encoded])
         test_A_encoded = test_A_encoded.values.reshape(test_A_encoded.shape[0], 1, test_A_encoded.shape[1])
         train_Y_scaled = train_Y_scaled.reshape(train_Y_scaled.shape[0], 1)
         test_Y_scaled = test_Y_scaled.reshape(test_Y_scaled.shape[0], 1)
 
         # Convert to tensors
-        train_X_tensor = torch.FloatTensor(train_X_scaled).to(self.device)
-        train_Y_tensor = torch.FloatTensor(train_Y_scaled).to(self.device)
-        train_A_tensor = torch.FloatTensor(train_A_encoded).to(self.device)
-        test_X_tensor = torch.FloatTensor(test_X_scaled).to(self.device)
-        test_Y_tensor = torch.FloatTensor(test_Y_scaled).to(self.device)
-        test_A_tensor = torch.FloatTensor(test_A_encoded).to(self.device)
+        train_X_tensor = torch.FloatTensor(train_X_scaled)
+        train_Y_tensor = torch.FloatTensor(train_Y_scaled)
+        train_A_tensor = torch.FloatTensor(train_A_encoded)
+        test_X_tensor = torch.FloatTensor(test_X_scaled)
+        test_Y_tensor = torch.FloatTensor(test_Y_scaled)
+        test_A_tensor = torch.FloatTensor(test_A_encoded)
 
         # Create dataloaders
         train_dataloader = torch.utils.data.DataLoader(
@@ -230,6 +239,7 @@ class BaseLSTM(Model, nn.Module):
             self.train()  # Set the model to training mode
             train_loss = 0.0
             for X_batch, A_batch, Y_batch in train_dataloader:
+                X_batch, A_batch, Y_batch = X_batch.to(self.device), A_batch.to(self.device), Y_batch.to(self.device)
                 optimizer.step()
                 outputs = self.forward(X_batch, A_batch)
                 loss = criterion(outputs, Y_batch)
@@ -245,6 +255,7 @@ class BaseLSTM(Model, nn.Module):
             test_loss = 0.0
             with torch.no_grad():
                 for X_batch, A_batch, Y_batch in test_dataloader:
+                    X_batch, A_batch, Y_batch = X_batch.to(self.device), A_batch.to(self.device), Y_batch.to(self.device)
                     outputs = self.forward(X_batch, A_batch)
                     loss = criterion(outputs, Y_batch)
                     test_loss += loss.item()
@@ -261,14 +272,15 @@ class BaseLSTM(Model, nn.Module):
             plt.ylabel('Loss')
             plt.title('Training and Test Loss')
             plt.legend()
-            plt.savefig('loss_plot.png')
+            plt.savefig('loss_plot_lstm.png')
+            plt.close()
 
             # Check for improvement
             if test_loss < best_loss:
                 best_loss = test_loss
                 no_improvement_counter = 0
                 # Save the model
-                torch.save(self.state_dict(), 'best_model.pth')
+                torch.save(self.state_dict(), 'best_model_lstm.pth')
                 print(f"Model saved with test loss: {best_loss/len(test_dataloader):.4f}")
             else:
                 no_improvement_counter += 1

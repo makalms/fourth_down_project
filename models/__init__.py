@@ -3,3 +3,4 @@
 from .model import *
 from .embedding_model import *
 from .base_lstm import *
+from .base_cnn import *
