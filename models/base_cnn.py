@@ -11,11 +11,13 @@ import torch
 import torch.nn as nn
 
 from sklearn.preprocessing import StandardScaler, MinMaxScaler
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
 
 from datasets import load_dataset
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+import seaborn as sns
 
 
 class BaseCNN(Model, nn.Module):
@@ -31,7 +33,7 @@ class BaseCNN(Model, nn.Module):
         self.num_layers = config.get("num_layers", 3)
         self.input_size = config.get("input_size", 5)
         self.output_size = config.get("output_size", 1)
-        self.a_mappings = config.get("a_mappings", {'go (run/pass)': 0, 'punt': 1, 'fg': 2})
+        self.a_mappings = config.get("a_mappings", {'go': 0, 'punt': 1, 'fg': 2})
         self.device = config.get("device", 'cuda')  # Use 'cuda' for GPU or 'cpu' for CPU
         # Switch to using cpu if cuda is not available
         if self.device == 'cuda' and torch.cuda.is_available() == False:
@@ -57,9 +59,9 @@ class BaseCNN(Model, nn.Module):
         self.cnn_inner = nn.Conv1d(
             in_channels=self.hidden_size,
             out_channels=self.hidden_size,  # Number of filters
-            kernel_size=9,  # Size of the filter
+            kernel_size=3,  # Size of the filter
             stride=1,  # Stride of the convolution
-            padding=4  # Padding to keep the output size the same as input size
+            padding=1  # Padding to keep the output size the same as input size
         )
         
         self.layer_norm = nn.LayerNorm(self.hidden_size)
@@ -109,18 +111,14 @@ class BaseCNN(Model, nn.Module):
         # Pass through the combination layer
         combined_input = self.combination_layer(combined_input).to(self.device)
 
-        # Pass through first CNN layer
+        # Pass through first CNN layer, followed by ReLU activation
         out = self.cnn_in(combined_input.unsqueeze(1))  # Add channel dimension
         out = torch.relu(out)
 
-        # Pass through second CNN layer num_layers times
-        # Alternate between relu and max pooling with softmax activation
+        # Pass through second CNN layer num_layers times, always followed by ReLU activation
         for i in range(self.num_layers - 1):
             out = self.cnn_inner(out)
-            if i % 2 == 0:
-                out = torch.relu(out)
-            else:
-                out = torch.softmax(out, dim=1)
+            out = torch.relu(out)
 
         # Apply Layer Normalization
         out = self.layer_norm(out)
@@ -276,19 +274,17 @@ class BaseCNN(Model, nn.Module):
             test_losses.append(test_loss/len(test_dataloader))
 
             # Plot training and test loss to files
-            plt.figure(figsize=(10, 5))
-            plt.plot(range(1, len(train_losses) + 1), train_losses, label='Train Loss')
+            plt.figure(figsize=(7, 4))
+            plt.plot(range(1, len(train_losses) + 1), train_losses, label='Train Loss', color='navy')
             plt.xlabel('Epochs')
             plt.ylabel('Loss')
-            plt.title('Train Loss')
             plt.legend()
             plt.savefig(save_path + '/train_loss_plot_cnn.png')
             plt.close()
-            plt.figure(figsize=(10, 5))
+            plt.figure(figsize=(7, 4))
             plt.plot(range(1, len(test_losses) + 1), test_losses, label='Test Loss', color='orange')
             plt.xlabel('Epochs')
             plt.ylabel('Loss')
-            plt.title('Test Loss')
             plt.legend()
             plt.savefig(save_path + '/test_loss_plot_cnn.png')
             plt.close()
@@ -331,7 +327,7 @@ class BaseCNN(Model, nn.Module):
         train_seasons = self.config.get("training_seasons", [2010, 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018, 2019])
         train = dataset[dataset['season'].isin(train_seasons)]
 
-        # We want to validate the model by calculating the output of the model for all possible actions for each state in the validation set, picking the action with the highest output, and plotting the distribution of the predicted actions vs. actual actions in a plot showing ydstogo vs. game_seconds_remaining, with the color of the points differentiating actions. There will be two plots, one for the predicted actions and one for the actual actions.
+        # We want to validate the model by calculating the output of the model for all possible actions for each state in the validation set. We also want to compare to a rule-advised model that only picks between go and fg in safe field goal range, all three actions in the maybe field goal range, and only go and punt outside of field goal range. 
 
         # Get the X, A columns from the validation set
         X_cols = self.config.get("x_columns", ['qtr', 'game_seconds_remaining', 'yardline_100', 'ydstogo', 'score_differential'])
@@ -373,6 +369,7 @@ class BaseCNN(Model, nn.Module):
         outputs = {}
         for action, action_tensor in zip(self.a_mappings.keys(), validation_A_tensors):
             outputs[action] = self.predict(validation_X_tensor, action_tensor)
+        print(outputs)
 
         # For the true validation labels, look at the actual action taken in the validation set and get the corresponding output from the model for that action. This will allow us to compare how far off the model's predictions were from the actual actions taken in the validation set.= in terms of predicted output. Save the output vs. actual wpa as a list of pairs of (predicted_output, actual_output) for each state in the validation set
         output_vs_actual = []
@@ -387,11 +384,9 @@ class BaseCNN(Model, nn.Module):
         print(f"Average absolute difference between predicted and actual outputs: {np.mean([abs(pair[0] - pair[1]) for pair in output_vs_actual])}")
 
         # Plot the distribution of the absolute differences between the predicted outputs and actual outputs in a histogram. Save the plot to a file.
-        plt.figure(figsize=(10, 10))
-        plt.hist([abs(pair[0] - pair[1]) for pair in output_vs_actual], bins=100, alpha=1, color='blue')
-        plt.xlabel('Absolute Difference')
-        plt.ylabel('Frequency')
-        plt.title('Distribution of Absolute Differences between Predicted and Actual Outputs')
+        plt.figure(figsize=(4, 4))
+        plt.hist([abs(pair[0] - pair[1]) for pair in output_vs_actual], bins=100, alpha=1, color='navy')
+        plt.xlabel('Abs. Difference Predicted vs. Actual WPA')
         plt.savefig(save_path + '/absolute_differences_histogram_cnn.png')
         plt.close()
 
@@ -401,108 +396,186 @@ class BaseCNN(Model, nn.Module):
             state_outputs = {action: outputs[action][i] for action in self.a_mappings.keys()}
             predicted_action = max(state_outputs, key=state_outputs.get)
             predicted_actions.append(predicted_action)
-        
+
+        # Also get the predicted action for the rule-advised model that only picks between go and fg in safe field goal range, all three actions in the maybe field goal range, and only go and punt outside of field goal range.
+        # Safe fieldgoal range: yardline_100 < 25
+        # Maybe fieldgoal range: 25 <= yardline_100 <= 50
+        # Outside fieldgoal range: yardline_100 > 50
+        # Both limits are very conservatively set, at least up to the 30 yard line is usually considered safe for a field goal in the NFL, and beyond the 50 yard line is close to the record for the longest field goal in NFL history
+        predicted_actions_rule_advised = []
+        for i in range(validation_X_tensor.shape[0]):
+            state_outputs = {action: outputs[action][i] for action in self.a_mappings.keys()}
+            yardline_100 = validation['yardline_100'].values.flatten()[i]
+            if yardline_100 < 25:
+                possible_actions = ['go', 'fg']
+            elif yardline_100 <= 50:
+                possible_actions = ['go', 'fg', 'punt']
+            else:
+                possible_actions = ['go', 'punt']
+            # Get the predicted action with the highest output among the possible actions
+            possible_outputs = {action: state_outputs[action] for action in possible_actions}
+            predicted_action = max(possible_outputs, key=possible_outputs.get)
+            predicted_actions_rule_advised.append(predicted_action)
+
         # Unencode the predicted actions and actual actions from their one-hot encodings to their original values using the mappings
         predicted_actions = [self.a_mappings.get(a, 0) for a in predicted_actions]
         predicted_actions = [list(self.a_mappings.keys())[list(self.a_mappings.values()).index(a)] for a in predicted_actions]
+        predicted_actions_rule_advised = [self.a_mappings.get(a, 0) for a in predicted_actions_rule_advised]
+        predicted_actions_rule_advised = [list(self.a_mappings.keys())[list(self.a_mappings.values()).index(a)] for a in predicted_actions_rule_advised]
         actual_actions = [self.a_mappings.get(a, 0) for a in validation_A.values.flatten()]
         actual_actions = [list(self.a_mappings.keys())[list(self.a_mappings.values()).index(a)] for a in actual_actions]
 
         # For plotting purposes, add some light noise to the ydstogo, so they aren't lined up in perfect vertical lines. This will make the plot easier to read.
         validation['ydstogo'] = validation['ydstogo'] + np.random.normal(0, 0.2, size=validation.shape[0])
 
-        # Plot the distribution of the predicted actions vs. actual actions in a plot showing ydstogo vs. game_seconds_remaining, with the color of the points differentiating actions. There will be two plots, one for the predicted actions and one for the actual actions.
-        colours = ['purple', 'turquoise', 'yellow']
+        # Plot the distribution of the predicted actions vs. actual actions in a plot showing ydstogo vs. game_seconds_remaining, with the color of the points differentiating actions. There will be three plots, one for the predicted actions, one for the actual actions, and one for the rule-advised model's predicted actions. The x-axis will be ydstogo and the y-axis will be game_seconds_remaining. The points will be colored according to the action taken. Save the plot to a file.
+        colours = ['navy', 'orange', 'maroon']
         colour_map = {action: colour for action, colour in zip(self.a_mappings.keys(), colours)}
-        plt.figure(figsize=(12, 12))
-        plt.subplot(2, 1, 1)
-        plt.scatter(validation['ydstogo'], validation['game_seconds_remaining'], c=[colour_map[a] for a in predicted_actions], alpha=0.5, s=20)
-        plt.title('Predicted Actions')
-        plt.xlabel('Yards to Go')
-        plt.ylabel('Game Seconds Remaining')
-        plt.legend(handles=[plt.Line2D([0], [0], marker='o', color='w', label=action, markersize=10, markerfacecolor=colour_map[action]) for action in self.a_mappings.keys()], title='Actions')
-        plt.tight_layout()
-        plt.subplot(2, 1, 2)
-        plt.scatter(validation['ydstogo'], validation['game_seconds_remaining'], c=[colour_map[a] for a in actual_actions], alpha=0.5, s=20)
-        plt.title('Actual Actions')
-        plt.xlabel('Yards to Go')
-        plt.ylabel('Game Seconds Remaining')
-        plt.legend(handles=[plt.Line2D([0], [0], marker='o', color='w', label=action, markersize=10, markerfacecolor=colour_map[action]) for action in self.a_mappings.keys()], title='Actions')
-        plt.tight_layout()
+        fig, ax = plt.subplots(1, 3, figsize=(12, 4))
+        ax[0].scatter(validation['ydstogo'], validation['game_seconds_remaining'], c=[colour_map[a] for a in predicted_actions], alpha=0.5, s=5)
+        ax[0].set_title('CNN Predictions')
+        ax[0].set_xlabel('Yards to Go')
+        ax[0].set_ylabel('Game Seconds Remaining')
+        ax[1].scatter(validation['ydstogo'], validation['game_seconds_remaining'], c=[colour_map[a] for a in predicted_actions_rule_advised], alpha=0.5, s=5)
+        ax[1].set_title('CNN Predictions + Rules')
+        ax[1].set_xlabel('Yards to Go')
+        ax[1].set_ylabel('Game Seconds Remaining')
+        ax[2].scatter(validation['ydstogo'], validation['game_seconds_remaining'], c=[colour_map[a] for a in actual_actions], alpha=0.5, s=5)
+        ax[2].set_title('Actual Actions')
+        ax[2].set_xlabel('Yards to Go')
+        ax[2].set_ylabel('Game Seconds Remaining')
+        # shared legend for all three plots, outside the plots
+        fig.legend(handles=[plt.Line2D([0], [0], marker='o', color='w', label=action, markersize=5, markerfacecolor=colour_map[action]) for action in self.a_mappings.keys()], loc='center right', title='Actions')
+        fig.tight_layout()
         plt.savefig(save_path + '/validation_plot_cnn.png')
         plt.close()
 
         # Plot the same thing again, but this time with the score differential on the x-axis
-        plt.figure(figsize=(12, 12))
-        plt.subplot(2, 1, 1)
-        plt.scatter(validation['ydstogo'], validation['score_differential'], c=[colour_map[a] for a in predicted_actions], alpha=0.5, s=20)
-        plt.title('Predicted Actions')
-        plt.xlabel('Yards to Go')
-        plt.ylabel('Score Differential')
-        plt.legend(handles=[plt.Line2D([0], [0], marker='o', color='w', label=action, markersize=10, markerfacecolor=colour_map[action]) for action in self.a_mappings.keys()], title='Actions')
-        plt.tight_layout()
-        plt.subplot(2, 1, 2)
-        plt.scatter(validation['ydstogo'], validation['score_differential'], c=[colour_map[a] for a in actual_actions], alpha=0.5, s=20)
-        plt.title('Actual Actions')
-        plt.xlabel('Yards to Go')
-        plt.ylabel('Score Differential')
-        plt.legend(handles=[plt.Line2D([0], [0], marker='o', color='w', label=action, markersize=10, markerfacecolor=colour_map[action]) for action in self.a_mappings.keys()], title='Actions')
-        plt.tight_layout()
+        fig, ax = plt.subplots(1, 3, figsize=(12, 4))
+        ax[0].scatter(validation['score_differential'], validation['game_seconds_remaining'], c=[colour_map[a] for a in predicted_actions], alpha=0.5, s=5)
+        ax[0].set_title('CNN Predictions')
+        ax[0].set_xlabel('Score Differential')
+        ax[0].set_ylabel('Game Seconds Remaining')
+        ax[1].scatter(validation['score_differential'], validation['game_seconds_remaining'], c=[colour_map[a] for a in predicted_actions_rule_advised], alpha=0.5, s=5)
+        ax[1].set_title('CNN Predictions + Rules')
+        ax[1].set_xlabel('Score Differential')
+        ax[1].set_ylabel('Game Seconds Remaining')
+        ax[2].scatter(validation['score_differential'], validation['game_seconds_remaining'], c=[colour_map[a] for a in actual_actions], alpha=0.5, s=5)
+        ax[2].set_title('Actual Actions')
+        ax[2].set_xlabel('Score Differential')
+        ax[2].set_ylabel('Game Seconds Remaining')
+        # shared legend for all three plots, outside the plots
+        fig.legend(handles=[plt.Line2D([0], [0], marker='o', color='w', label=action, markersize=5, markerfacecolor=colour_map[action]) for action in self.a_mappings.keys()], loc='center right', title='Actions')
+        fig.tight_layout()
         plt.savefig(save_path + '/validation_plot_score_diff_cnn.png')
         plt.close()
-        
 
         # Also plot it as an overlay onto a football field, with the yardline_100 on the x-axis, and the yards to go on the y-axis, and the color of the points differentiating actions. There will be two plots, one for the predicted actions and one for the actual actions. The football field should be 100 yards long and 53 yards wide, with the end zones being 10 yards deep. The field should have white lines every 10 yards, with the yard numbers labeled on the field.
-        validation['yards_to_go'] = validation['ydstogo']/validation['ydstogo'].max() * 53  # Scale ydstogo to fit within the width of the field (53 yards)
-
-        colours = ['red', 'purple', 'blue']
+        
+        # Get max and min of yards to go, to set the limits of the y-axis. We should also adjust the y-axis to be somewhat proportional to the x-axis, so that the field looks like a football field.
+        max_ydstogo = validation['ydstogo'].max()
+        min_ydstogo = validation['ydstogo'].min()
+        colours = ['navy', 'orange', 'maroon']
         colour_map = {action: colour for action, colour in zip(self.a_mappings.keys(), colours)}
-        fig, ax = plt.subplots(2, 1, figsize=(14, 12))
+        fig, ax = plt.subplots(3, 1, figsize=(10, 12))
         # Make the plots look like a football field, with green field, white lines with yard numbers, and the end zones with the team names. The field should be 100 yards long and 53 yards wide, with the end zones being 10 yards deep.
-        for i in range(2):
+        for i in range(3):
             ax[i].set_facecolor('green')
             ax[i].set_xlim(-10, 110)
-            ax[i].set_ylim(0, 53)
+            ax[i].set_ylim(min_ydstogo, max_ydstogo)
             # Draw the yard lines
             for yard in range(0, 101, 10):
                 ax[i].axvline(x=yard, color='white', linewidth=2)
                 if yard > 0 and yard < 100:
-                    ax[i].text(yard, 5, str(yard), color='white', fontsize=12, fontweight='bold', ha='center', va='center')
-                    ax[i].text(yard, 48, str(yard), color='white', fontsize=12, fontweight='bold', ha='center', va='center', rotation=180)
+                    ax[i].text(yard, max_ydstogo - (max_ydstogo - min_ydstogo) * 0.1, str(yard), color='white', fontsize=8, fontweight='bold', ha='center', va='center')
+                    ax[i].text(yard, min_ydstogo + (max_ydstogo - min_ydstogo) * 0.1, str(yard), color='white', fontsize=8, fontweight='bold', ha='center', va='center', rotation=180)
             # Draw the end zones (dark orange with navy blue text for the Broncos, and navy blue with neon green text for the Seahawks)
             ax[i].axvspan(-10, 0, color='darkorange')
             ax[i].axvspan(100, 110, color='navy')
-            ax[i].text(-5, 26.5, 'Broncos', color='navy', fontsize=30, fontweight='bold', ha='center', va='center', rotation=90)
-            ax[i].text(105, 26.5, 'Seahawks', color='lime', fontsize=30, fontweight='bold', ha='center', va='center', rotation=270)
+            ax[i].text(-5, (max_ydstogo + min_ydstogo) / 2, 'Endzone', color='navy', fontsize=20, fontweight='bold', ha='center', va='center', rotation=90)
+            ax[i].text(105, (max_ydstogo + min_ydstogo) / 2, 'Endzone', color='darkorange', fontsize=20, fontweight='bold', ha='center', va='center', rotation=270)
             # Label the axes
             ax[i].set_xlabel('Yardline (100 = Opponent End Zone)', fontsize=12)
             ax[i].set_ylabel('Yards to Go', fontsize=12)
         # Plot the predicted actions
-        ax[0].scatter(validation['yardline_100'], validation['yards_to_go'], c=[colour_map[a] for a in predicted_actions], alpha=0.5, s=10)
-        ax[0].set_title('Predicted Actions', fontsize=14)
+        ax[0].scatter(validation['yardline_100'], validation['ydstogo'], c=[colour_map[a] for a in predicted_actions], alpha=0.5, s=10)
+        ax[0].set_title('CNN Predictions', fontsize=14)
+        # Plot the predicted actions for the rule-advised model
+        ax[1].scatter(validation['yardline_100'], validation['ydstogo'], c=[colour_map[a] for a in predicted_actions_rule_advised], alpha=0.5, s=10)
+        ax[1].set_title('CNN Predictions + Rules', fontsize=14)
         # Plot the actual actions
-        ax[1].scatter(validation['yardline_100'], validation['yards_to_go'], c=[colour_map[a] for a in actual_actions], alpha=0.5, s=10)
-        ax[1].set_title('Actual Actions', fontsize=14)
+        ax[2].scatter(validation['yardline_100'], validation['ydstogo'], c=[colour_map[a] for a in actual_actions], alpha=0.5, s=10)
+        ax[2].set_title('Actual Actions', fontsize=14)
         # Shared legend for both plots, outside the plots
-        handles = [plt.Line2D([0], [0], marker='o', color='w', label=action, markersize=10, markerfacecolor=colour_map[action]) for action in self.a_mappings.keys()]
-        fig.legend(handles=handles, title='Actions', loc='lower center', ncol=len(self.a_mappings.keys()), fontsize=12)
-        fig.suptitle('Predicted vs. Actual Actions on Football Field', fontsize=16)
+        fig.legend(handles=[plt.Line2D([0], [0], marker='o', color='w', label=action, markersize=5, markerfacecolor=colour_map[action]) for action in self.a_mappings.keys()], loc='center right', title='Actions')
+        fig.tight_layout()
         plt.savefig(save_path + '/validation_plot_field_cnn.png')
         plt.close()
 
         # Finally, we will calculate the accuracy, precision, recall, and F1 score of the predicted actions vs. the actual actions, and print them to the console. We will also print the confusion matrix.
-        from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, confusion_matrix
-        accuracy = accuracy_score(actual_actions, predicted_actions)
-        precision = precision_score(actual_actions, predicted_actions, average='weighted', zero_division=0)
-        recall = recall_score(actual_actions, predicted_actions, average='weighted', zero_division=0)
-        f1 = f1_score(actual_actions, predicted_actions, average='weighted', zero_division=0)
-        print(f"Accuracy: {accuracy:.4f}")
-        print(f"Precision: {precision:.4f}")
-        print(f"Recall: {recall:.4f}")
-        print(f"F1 Score: {f1:.4f}")
-        cm = confusion_matrix(actual_actions, predicted_actions)
+        print("Validation Metrics for CNN Model:")
+        accuracy_cnn = accuracy_score(actual_actions, predicted_actions)
+        precision_cnn = precision_score(actual_actions, predicted_actions, average='weighted', zero_division=0)
+        recall_cnn = recall_score(actual_actions, predicted_actions, average='weighted', zero_division=0)
+        f1_cnn = f1_score(actual_actions, predicted_actions, average='weighted', zero_division=0)
+        print(f"Accuracy: {accuracy_cnn:.4f}")
+        print(f"Precision: {precision_cnn:.4f}")
+        print(f"Recall: {recall_cnn:.4f}")
+        print(f"F1 Score: {f1_cnn:.4f}")
+        cm_cnn = confusion_matrix(actual_actions, predicted_actions)
         print("Confusion Matrix:")
-        print(cm)
+        print(cm_cnn)
+
+        print("Validation Metrics for CNN Model + Rules:")
+        accuracy_cnn_rule_advised = accuracy_score(actual_actions, predicted_actions_rule_advised)
+        precision_cnn_rule_advised = precision_score(actual_actions, predicted_actions_rule_advised, average='weighted', zero_division=0)
+        recall_cnn_rule_advised = recall_score(actual_actions, predicted_actions_rule_advised, average='weighted', zero_division=0)
+        f1_cnn_rule_advised = f1_score(actual_actions, predicted_actions_rule_advised, average='weighted', zero_division=0)
+        print(f"Accuracy: {accuracy_cnn_rule_advised:.4f}")
+        print(f"Precision: {precision_cnn_rule_advised:.4f}")
+        print(f"Recall: {recall_cnn_rule_advised:.4f}")
+        print(f"F1 Score: {f1_cnn_rule_advised:.4f}")
+        cm_cnn_rule_advised = confusion_matrix(actual_actions, predicted_actions_rule_advised)
+        print("Confusion Matrix:")
+        print(cm_cnn_rule_advised)
+
+        # Also save the metrics to a text file
+        with open(save_path + '/validation_metrics_cnn.txt', 'w') as f:
+            f.write("Validation Metrics for CNN Model:\n")
+            f.write(f"Accuracy: {accuracy_cnn:.4f}\n")
+            f.write(f"Precision: {precision_cnn:.4f}\n")
+            f.write(f"Recall: {recall_cnn:.4f}\n")
+            f.write(f"F1 Score: {f1_cnn:.4f}\n")
+            f.write("Confusion Matrix:\n")
+            f.write(str(cm_cnn) + "\n\n")
+
+            f.write("Validation Metrics for CNN Model + Rules:\n")
+            f.write(f"Accuracy: {accuracy_cnn_rule_advised:.4f}\n")
+            f.write(f"Precision: {precision_cnn_rule_advised:.4f}\n")
+            f.write(f"Recall: {recall_cnn_rule_advised:.4f}\n")
+            f.write(f"F1 Score: {f1_cnn_rule_advised:.4f}\n")
+            f.write("Confusion Matrix:\n")
+            f.write(str(cm_cnn_rule_advised) + "\n")
+        
+        # Finally plot the confusion matrices as heatmaps and save them to a file
+        plt.figure(figsize=(4, 4))
+        sns.heatmap(cm_cnn, annot=True, fmt='d', cmap='rocket_r', xticklabels=self.a_mappings.keys(), yticklabels=self.a_mappings.keys())
+        plt.xlabel('Predicted Actions')
+        plt.ylabel('Actual Actions')
+        plt.title('CNN Model')
+        plt.savefig(save_path + '/confusion_matrix_cnn.png')
+        fig.tight_layout()
+        plt.close()
+        plt.figure(figsize=(4, 4))
+        sns.heatmap(cm_cnn_rule_advised, annot=True, fmt='d', cmap='rocket_r', xticklabels=self.a_mappings.keys(), yticklabels=self.a_mappings.keys())
+        plt.xlabel('Predicted Actions')
+        plt.ylabel('Actual Actions')
+        plt.title('CNN Model + Rules')
+        fig.tight_layout()
+        plt.savefig(save_path + '/confusion_matrix_cnn_rule_advised.png')
+        plt.close()
+
+
 
         
 
