@@ -14,7 +14,7 @@ class Model():
         # Function that will be called to make predictions using the model. It should take in the confounders/state X and return the predicted outcome/label.
         pass
 
-    def train(self, X, A, Y):
+    def training_loop(self):
         # Function that will be called to train the model. It should take in the confounders/state X, the action/treatment A, and the outcome/label Y and train the model accordingly.
         # THe training function should save the model and metrics after training. Ideally we would use mlflow for this. There is quite a bit of boilerplate code for this, and I'm wondering if this should be implemented here in the base model class so that we don't have to implement it for each specific model. However, I'm unsure if this would still work for the basic regression models, to track the same metrics and such.
         pass

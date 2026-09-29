@@ -1,0 +1,19 @@
+Validation Metrics for CNN Model:
+Accuracy: 0.5546
+Precision: 0.7098
+Recall: 0.5546
+F1 Score: 0.5637
+Confusion Matrix:
+[[1710  279    5]
+ [ 712  855   80]
+ [ 595 1723 1661]]
+
+Validation Metrics for CNN Model + Rules:
+Accuracy: 0.5864
+Precision: 0.7211
+Recall: 0.5864
+F1 Score: 0.6022
+Confusion Matrix:
+[[1710  279    5]
+ [ 613  900  134]
+ [ 303 1818 1858]]
