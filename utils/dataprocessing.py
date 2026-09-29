@@ -5,8 +5,6 @@ Functions for dataprocessing, including splitting the data into training and tes
 import torch
 import pandas as pd
 
-from models import Embedding_Model
-
 
 def train_test_split(X, A, Y, config):
 
